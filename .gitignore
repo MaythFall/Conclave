@@ -1,0 +1,4 @@
+notes.txt
+*.vscode
+*.cclave
+src/__pycache__
