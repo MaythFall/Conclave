@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Conclave | Control Plane</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #121212; color: #e0e0e0; padding: 40px; }
+        .container { max-width: 800px; margin: auto; }
+        h1 { color: #00ffcc; border-bottom: 2px solid #333; padding-bottom: 10px; }
+        .card { background: #1e1e1e; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+        input { background: #2a2a2a; border: 1px solid #444; color: white; padding: 10px; border-radius: 4px; margin-right: 10px; }
+        button { background: #00ffcc; color: #121212; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        button:hover { background: #00cca3; }
+        button.delete { background: #ff4d4d; color: white; margin-left: 10px; }
+        .room-item { display: flex; justify-content: space-between; align-items: center; padding: 15px; border-bottom: 1px solid #333; }
+        .status { font-size: 0.8em; color: #888; margin-top: 10px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>CONCLAVE_CORE</h1>
+
+    <div class="card">
+        <h3>Initialize New Room</h3>
+        <input type="text" id="roomName" placeholder="Room Name">
+        <input type="password" id="roomPw" placeholder="Password">
+        <button onclick="createRoom()">CREATE</button>
+    </div>
+
+    <div class="card">
+        <h3>Active Network Segments</h3>
+        <div id="roomList">
+            <p>Scanning for active rooms...</p>
+        </div>
+        <div class="status" id="lastSync">Last Sync: Never</div>
+    </div>
+</div>
+
+<script>
+    const API_BASE = "http://127.0.0.1:8000";
+
+    // Fetch and display rooms
+    async function refreshRooms() {
+        try {
+            const response = await fetch(`${API_BASE}/rooms`);
+            const data = await response.json();
+            const list = document.getElementById('roomList');
+            const sync = document.getElementById('lastSync');
+            
+            list.innerHTML = "";
+            const roomEntries = Object.entries(data.rooms);
+
+            if (roomEntries.length === 0) {
+                list.innerHTML = "<p>No active rooms found on the core.</p>";
+            } else {
+                roomEntries.forEach(([id, name]) => {
+                    list.innerHTML += `
+                        <div class="room-item">
+                            <span><strong>${name}</strong> (ID: ${id})</span>
+                            <div>
+                                <button onclick="joinRoom(${id})">JOIN</button>
+                                <button class="delete" onclick="deleteRoom(${id})">DESTROY</button>
+                            </div>
+                        </div>
+                    `;
+                });
+            }
+            sync.innerText = `Last Sync: ${new Date().toLocaleTimeString()}`;
+        } catch (err) {
+            console.error("Failed to sync with Bridge:", err);
+        }
+    }
+
+    // Create Room
+    async function createRoom() {
+        const name = document.getElementById('roomName').value;
+        const pw = document.getElementById('roomPw').value;
+        
+        await fetch(`${API_BASE}/create-room?room_name=${name}&room_pw=${pw}`, { method: 'POST' });
+        document.getElementById('roomName').value = "";
+        document.getElementById('roomPw').value = "";
+        setTimeout(refreshRooms, 500); // Wait for C++ sync
+    }
+
+    // Delete Room
+    async function deleteRoom(id) {
+        const pw = prompt("Enter Room Admin Password to Destroy:");
+        if (!pw) return;
+        
+        await fetch(`${API_BASE}/delete-room?roomId=${id}&room_pw=${pw}`, { method: 'POST' });
+        setTimeout(refreshRooms, 500);
+    }
+
+    // Join Room (Placeholder for your verify_room logic)
+    function joinRoom(id) {
+        const uid = Math.floor(Math.random() * 10000); // Simulate a User ID
+        const pw = prompt("Enter Room Password:");
+        fetch(`${API_BASE}/${name}/${id}/join?user_id=${uid}&password=${pw}`, { method: 'PUT' });
+        alert(`Sent Join Request for UID ${uid} to Room ${id}`);
+    }
+
+    // Initial load and polling
+    refreshRooms();
+    setInterval(refreshRooms, 3000);
+</script>
+
+</body>
+</html>

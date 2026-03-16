@@ -11,6 +11,8 @@
 #include <thread>
 #include <bit>
 #include <iostream>
+#include <random>
+#include "CC_SHA256.hpp"
 
 namespace conclave {
 
@@ -22,15 +24,24 @@ namespace conclave {
             int socket_descriptor[2] = {-1, -1};
             int private_fd = -1;
 
+            std::string SECRET;
+
             std::unordered_map<ID, FDESC> users;
             std::unordered_map<FDESC, ID> _users;
             std::unordered_map<ID, Room> rooms;
             std::unordered_map<ID, ID> user2room;
+            std::unordered_map<FDESC, std::chrono::steady_clock::time_point> pending_auth;
             std::mutex add_user;
 
-            inline ID generate_new_uid() noexcept {
-                ID id = random();
-                while (users.find(id) != users.end()) id = random();
+            inline ID generate_new_uid(uint8_t* _seed, size_t len) noexcept {
+                size_t seed = 0;
+                for (size_t i = 0; i < len; ++i) seed ^= static_cast<size_t>(_seed[i]) + 0x7d418a6f + (seed << 6) + (seed >> 2);
+                
+                std::mt19937 gen(seed);
+                std::uniform_int_distribution<ID> dist(1000, 999999);
+                
+                ID id = dist(gen);
+                while (users.find(id) != users.end()) id = dist(gen);
                 return id;
             }
 
@@ -89,12 +100,13 @@ namespace conclave {
                 if constexpr (Private) {
                     private_fd = new_fd;
                     std::cout << "[CONTROL] Python Bridge linked on FD " << new_fd << std::endl;
+                    std::vector<uint8_t> secretmsg(SECRET.begin(), SECRET.end());
+                    secretmsg.insert(secretmsg.begin(), static_cast<uint8_t>(MessageType::CMD));
+                    send_message_fd(private_fd, secretmsg);
                     send_room_list(new_fd);
                 } else {
-                    ID uid = generate_new_uid();
-                    users.emplace(uid, new_fd);
-                    _users.emplace(new_fd, uid);
-                    std::cout << "[DATA] User linked on FD " << new_fd << " (UID: " << uid << ")" << std::endl;
+                    pending_auth.emplace(new_fd, std::chrono::steady_clock::now());
+                    std::cout << "[PENDING] Waiting for authorization on FD " << new_fd << std::endl;
                 }
             }
 
@@ -134,6 +146,45 @@ namespace conclave {
                 buffer.resize(size);
                 if (!read_exact(fd, buffer.data(), size))
                     throw std::runtime_error("Connection closed reading body from fd " + std::to_string(fd));
+                if (pending_auth.contains(fd)) verify_connection(fd, buffer);
+                else {
+                    send_message(buffer);
+                }
+                
+            }
+
+            void verify_connection(FDESC fd, SecureBuffer<uint8_t>& buffer) {
+                if (buffer.size() < 72) { 
+                    std::cerr << "[SECURITY] Packet too small for handshake\n";
+                    close_fd(fd);
+                    return;
+                }
+                ID uid;
+                memcpy(&uid, buffer.data(), sizeof(ID));
+                uid = ntohl(uid);
+
+                std::string message_data(reinterpret_cast<char*>(buffer.data()), 40); 
+                std::vector<uint8_t> received_sig(buffer.begin() + 40, buffer.begin() + 72);
+
+                
+                auto calculated_sig = Crypto::hmac_sha256(SECRET, message_data);
+
+                if (Crypto::verify(calculated_sig, received_sig)) {
+                    std::lock_guard<std::mutex> lock(add_user);
+                    
+                    if (users.contains(uid) && users[uid] == -1) {
+                        users[uid] = fd;
+                        _users[fd] = uid;
+                        pending_auth.erase(fd);
+                        std::cout << "[AUTH] User " << uid << " promoted to active socket.\n";
+                    } else {
+                        std::cerr << "[SECURITY] UID " << uid << " not in pending state.\n";
+                        close_fd(fd);
+                    }
+                } else {
+                    std::cerr << "[SECURITY] HMAC Mismatch on FD " << fd << "\n";
+                    close_fd(fd);
+                }
             }
 
             void end_connection(ID uid) {
@@ -168,79 +219,137 @@ namespace conclave {
                 close_fd(fd);
             }
 
+            //Connects User with a Room 
+            void join_room_CMD(SecureBuffer<uint8_t> &cmd) {
+                ID target_room, target_user;
+                memcpy(&target_room, cmd.data() + 1, sizeof(ID));
+                memcpy(&target_user, cmd.data() + 5, sizeof(ID));
+
+                target_room = ntohl(target_room);
+                target_user = ntohl(target_user);
+
+                if (!rooms.contains(target_room)) return;
+                uint8_t* pass_ptr = cmd.data() + 9;
+                size_t pass_len = cmd.size() - 9;
+
+                if (verify_room_access(target_room, pass_ptr, pass_len)) {
+                    rooms.at(target_room).users.emplace(target_user);
+                    user2room[target_user] = target_room;
+
+                    std::vector<uint8_t> ack(5);
+                    ack[0] = static_cast<uint8_t>(MessageType::ACK);
+                    uint32_t net_uid = htonl(target_user);
+                    memcpy(ack.data() + 1, &net_uid, sizeof(uint32_t));
+                    
+                    send_message_fd(private_fd, ack);
+                    std::cout << "[ACK] User " << target_user << " joined Room " << target_room << std::endl;
+                }
+            }
+
+            //Removes User from a Room
+            void leave_room_CMD(SecureBuffer<uint8_t> &cmd) {
+                ID target_room, target_user;
+                memcpy(&target_room, cmd.data() + 1, sizeof(ID));
+                memcpy(&target_user,  cmd.data() + 1 + sizeof(ID), sizeof(ID));
+                target_room = ntohl(target_room);
+                target_user = ntohl(target_user);
+                if (!rooms.contains(target_room)) return;
+                rooms.at(target_room).users.erase(target_user);
+                user2room.erase(target_user);
+            }
+
+            void create_room_CMD(SecureBuffer<uint8_t> &cmd) {
+                std::string data(cmd.begin() + 1, cmd.end());
+                size_t sep = data.find('~');
+                if (sep == std::string::npos) return;
+
+                std::string name = data.substr(0, sep);
+                std::string password = data.substr(sep + 1);
+                ID rid = generate_new_roomID();
+                rooms.emplace(rid, Room(name, password));
+                std::cout << "[ROOM] Created '" << name << "' (ID: " << rid << ")" << std::endl;
+                send_room_list(private_fd);
+            }
+
+            void destroy_room_CMD(SecureBuffer<uint8_t> &cmd) {
+                ID target_room;
+                memcpy(&target_room, cmd.data() + 1, sizeof(ID));
+                target_room = ntohl(target_room); // Correctly handle network byte order
+
+                // Extraction of password for verification
+                 std::string pass(cmd.begin() + 1 + sizeof(ID), cmd.end());
+                
+                if (rooms.contains(target_room) && verify_room_access(target_room, reinterpret_cast<uint8_t*>(pass.data()), pass.length())) {
+                    rooms.erase(target_room);
+                    send_room_list(private_fd);
+                }
+            }
+
+            void disconnect_CMD(SecureBuffer<uint8_t> &cmd) {
+                ID uid;
+                memcpy(&uid, cmd.data() + 1, sizeof(ID));
+                uid = ntohl(uid);
+                if (!users.contains(uid)) return;
+                end_connection(uid);
+            }
+
+            /*
+            *   Executes a Command on the server
+            *   Command Structure: [CMD(1)] [Details(N)]
+            *   JOIN: [CMD(1)] [RoomId(4)] [UserId(4)] [Password(N)]
+            *   LEAVE: [CMD(1)] [RoomId(4)] [UserId(4)]
+            *   CREATE: [CMD(1)] [name~password (N)]
+            *   DESTROY: [CMD(1)][RoomId(4)][Password(N)]
+            *   DISCONNECT: [CMD(1)] [UserId(4)]
+            *   CONNECT: [CMD(1)] [TabId(N)]
+            */
             void execute_command(SecureBuffer<uint8_t>& cmd) {
                 if (cmd.empty()) return;
                 Commands command = static_cast<Commands>(cmd.front());
-
                 switch (command) {
-                    case Commands::JOIN: {
-                        // Expect: [CMD(1)] [room_id(4)] [user_id(4)]
+                    case Commands::JOIN:
+                        std::cout << "Received Join Request\n";
                         if (cmd.size() < 1 + sizeof(ID) + sizeof(ID)) return;
-                        ID target_room, target_user;
-                        memcpy(&target_room, cmd.data() + 1, sizeof(ID));
-                        memcpy(&target_user,  cmd.data() + 1 + sizeof(ID), sizeof(ID));
-                        target_room = ntohl(target_room);
-                        target_user = ntohl(target_user);
-                        if (!rooms.contains(target_room)) return;
-                        rooms.at(target_room).users.emplace(target_user);
-                        user2room[target_user] = target_room;
-                    } break;
-
-                    case Commands::LEAVE: {
-                        // Expect: [CMD(1)] [room_id(4)] [user_id(4)]
+                        
+                        join_room_CMD(cmd);
+                    break;
+                    case Commands::LEAVE:
                         if (cmd.size() < 1 + sizeof(ID) + sizeof(ID)) return;
-                        ID target_room, target_user;
-                        memcpy(&target_room, cmd.data() + 1, sizeof(ID));
-                        memcpy(&target_user,  cmd.data() + 1 + sizeof(ID), sizeof(ID));
-                        target_room = ntohl(target_room);
-                        target_user = ntohl(target_user);
-                        if (!rooms.contains(target_room)) return;
-                        rooms.at(target_room).users.erase(target_user);
-                        user2room.erase(target_user); // FIX: was missing previously
-                    } break;
-
-                    case Commands::CREATE: {
-                        // Expect: [CMD(1)] [name~password (variable)]
+                        leave_room_CMD(cmd);
+                    break;
+                    case Commands::CREATE:
                         if (cmd.size() < 2) return;
-                        std::string data(cmd.begin() + 1, cmd.end());
-                        size_t sep = data.find('~');
-                        if (sep == std::string::npos) return;
-                        // FIX: was substr(0, sep-1) which dropped the last char of the name
-                        std::string name = data.substr(0, sep);
-                        std::string password = data.substr(sep + 1);
-                        ID rid = generate_new_roomID();
-                        rooms.emplace(rid, Room(name, password));
-                        std::cout << "[ROOM] Created '" << name << "' (ID: " << rid << ")" << std::endl;
-                        send_room_list(private_fd);
-                    } break;
-
-                    case Commands::DESTROY: {
-                        // Expect: [CMD(1)] [room_id(4)]
+                        create_room_CMD(cmd);
+                    break;
+                    case Commands::DESTROY:
                         if (cmd.size() < 1 + sizeof(ID)) return;
-                        ID target_room;
-                        memcpy(&target_room, cmd.data() + 1, sizeof(ID));
-                        target_room = ntohl(target_room);
-                        if (!rooms.contains(target_room)) return;
-
-                        // FIX: build a proper vector<uint8_t> — reinterpret_cast<vector&>(string) is UB
-                        std::string msg_str = "Room has been destroyed";
-                        std::vector<uint8_t> msg_bytes(msg_str.begin(), msg_str.end());
-                        // Send before erasing so the room member list is still valid
-                        send_message_room(target_room, msg_bytes);
-                        rooms.erase(target_room);
-                        send_room_list(private_fd);
-                    } break;
-
-                    case Commands::DISCONNECT: {
-                        // Expect: [CMD(1)] [user_id(4)]
+                        destroy_room_CMD(cmd);
+                    break;
+                    case Commands::DISCONNECT:
                         if (cmd.size() < 1 + sizeof(ID)) return;
-                        ID uid;
-                        memcpy(&uid, cmd.data() + 1, sizeof(ID));
-                        uid = ntohl(uid);
-                        if (!users.contains(uid)) return;
-                        end_connection(uid);
-                    } break;
+                        disconnect_CMD(cmd);
+                    break;
+                    case Commands::CONNECT:
+                        if (cmd.size() < 2) return;
+                        int uid = generate_new_uid(cmd.data()+1, cmd.size()-1);
+                        users.emplace(uid, -1);
+                        uid = htonl(uid);
+                        std::vector<uint8_t> msg;
+                        msg.emplace_back(static_cast<uint8_t>(MessageType::ACK));
+                        msg.emplace_back(0);
+                        msg.insert(msg.end(), reinterpret_cast<uint8_t*>(&uid), reinterpret_cast<uint8_t*>(&uid) + 4);
+                        msg.insert(msg.end(), cmd.begin()+1, cmd.end());
+                        send_message_fd(private_fd, msg);
+                    break;
                 }
+            }
+
+            bool verify_room_access(ID roomId, uint8_t *password, int len) {
+                //temp password matching
+                Room& room = rooms.at(roomId);
+                std::string pass(reinterpret_cast<char*>(password), len);
+                if (room.password.empty() || (pass == room.password)) return true;
+                return false;
             }
 
             // Fan-out a message buffer to every user in a room.
@@ -271,7 +380,6 @@ namespace conclave {
                 }
             }
 
-            // FIX: renamed from send_message(SecureBuffer&) to avoid silent overload ambiguity
             void send_message(SecureBuffer<uint8_t>& msg) {
                 if (msg.size() < 4) return;
                 uint32_t dest;
@@ -349,6 +457,11 @@ namespace conclave {
                         throw std::runtime_error("Failed to bind socket " + std::to_string(i));
                     listen(socket_descriptor[i], i == 0 ? BACKLOG : 5);
                 }
+
+                //Create Secret Key
+                std::string key = std::to_string(random());
+                auto t = Crypto::hmac_sha256(key, SECRET); 
+                SECRET.insert(SECRET.end(), t.begin(), t.end());
             }
 
             void run_server() {

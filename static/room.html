@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Conclave | Segment Active</title>
+    <style>
+        body { font-family: 'Courier New', monospace; background: #0a0a0a; color: #00ff41; padding: 40px; }
+        .terminal { border: 1px solid #00ff41; padding: 20px; box-shadow: 0 0 15px #00ff41; min-height: 400px; }
+        .input-area { margin-top: 20px; display: flex; }
+        input { background: #000; border: 1px solid #00ff41; color: #00ff41; flex-grow: 1; padding: 10px; }
+    </style>
+</head>
+<body>
+    <h2 id="roomTitle">ACCESSING_SEGMENT...</h2>
+    <div class="terminal" id="chatLog">
+        [SYSTEM] Handshake initiated...<br>
+        [SYSTEM] Awaiting Divalia encryption layer...
+    </div>
+    <div class="input-area">
+        <input type="text" id="msg" placeholder="Type encrypted message...">
+        <button style="background:#00ff41; border:none; padding:10px;" onclick="send()">SEND</button>
+    </div>
+
+    <script>
+        const urlParams = new URLSearchParams(window.location.search);
+        const roomId = urlParams.get('id');
+        document.getElementById('roomTitle').innerText = `SEGMENT_ID: ${roomId}`;
+
+        function send() {
+            const text = document.getElementById('msg').value;
+            // This will eventually go to your Public Port 12578!
+            console.log("Encrypted Payload:", text);
+            document.getElementById('msg').value = '';
+        }
+    </script>
+</body>
+</html>

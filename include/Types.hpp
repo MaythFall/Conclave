@@ -81,6 +81,7 @@ namespace conclave {
         void reserve(size_t size) const { data_.reserve(size); }
         T back() const { return data_.back(); }
         T front() const { return data_.front(); }
+        T front() { return data_.front(); }
 
         template <typename InputIt>
         void insert(auto pos, InputIt first, InputIt last) {
@@ -94,7 +95,8 @@ namespace conclave {
     enum class MessageType : uint8_t {
         MSG,
         CMD,
-        ROOM_LIST
+        ROOM_LIST,
+        ACK
     };
 
     enum class Commands : uint8_t {
@@ -102,7 +104,8 @@ namespace conclave {
         LEAVE,
         CREATE,
         DESTROY,
-        DISCONNECT
+        DISCONNECT,
+        CONNECT
     };
 
     struct Room {
