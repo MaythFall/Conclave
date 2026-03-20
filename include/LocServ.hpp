@@ -31,7 +31,9 @@ namespace conclave {
             std::unordered_map<ID, Room> rooms;
             std::unordered_map<ID, ID> user2room;
             std::unordered_map<FDESC, std::chrono::steady_clock::time_point> pending_auth;
-            std::mutex add_user;
+            std::unordered_map<FDESC, std::chrono::steady_clock::time_point> last_seen;
+            std::recursive_mutex add_user;
+            std::mutex room_manager;
 
             inline ID generate_new_uid(uint8_t* _seed, size_t len) noexcept {
                 size_t seed = 0;
@@ -80,7 +82,6 @@ namespace conclave {
 
                 int master_fd = Private ? socket_descriptor[1] : socket_descriptor[0];
                 int new_fd = accept(master_fd, (sockaddr*)&addr, &len);
-
                 if (new_fd < 0) return;
 
                 // Use level-triggered EPOLLIN only — simpler and correct for our
@@ -162,6 +163,7 @@ namespace conclave {
                 ID uid;
                 memcpy(&uid, buffer.data(), sizeof(ID));
                 uid = ntohl(uid);
+                std::cout << "[CONNECT] Verifying connection on FD: " << fd << " for User: " << uid << std::endl;
 
                 std::string message_data(reinterpret_cast<char*>(buffer.data()), 40); 
                 std::vector<uint8_t> received_sig(buffer.begin() + 40, buffer.begin() + 72);
@@ -170,7 +172,7 @@ namespace conclave {
                 auto calculated_sig = Crypto::hmac_sha256(SECRET, message_data);
 
                 if (Crypto::verify(calculated_sig, received_sig)) {
-                    std::lock_guard<std::mutex> lock(add_user);
+                    std::lock_guard<std::recursive_mutex> lock(add_user);
                     
                     if (users.contains(uid) && users[uid] == -1) {
                         users[uid] = fd;
@@ -201,22 +203,38 @@ namespace conclave {
             }
 
             void end_connectionFD(FDESC fd) {
+                // 1. Lock User State
+                std::lock_guard<std::recursive_mutex> u_lock(add_user);
+                
+                // Always scrub the pulse and pending maps
+                last_seen.erase(fd);
+                pending_auth.erase(fd);
+
                 auto it = _users.find(fd);
                 if (it == _users.end()) {
-                    // Unknown fd (e.g. private bridge) — just close cleanly
                     close_fd(fd);
                     return;
                 }
+
                 ID uid = it->second;
                 _users.erase(it);
+                users.erase(uid);
+
+                // 2. Lock Room State
+                // If you have a separate room_manager mutex, use it here
+                // std::lock_guard<std::mutex> r_lock(room_manager);
+                
                 if (user2room.contains(uid)) {
                     ID rid = user2room[uid];
                     rooms.at(rid).users.erase(uid);
                     user2room.erase(uid);
-                    if (rooms.at(rid).users.empty()) rooms.erase(rid);
+                    
+                    // NOTE: We do NOT erase the room here. 
+                    // We let the garbage_collector handle the 5-second grace period.
                 }
-                users.erase(uid);
+
                 close_fd(fd);
+                std::cout << "[CLEANUP] Resources released for FD: " << fd << " (UID: " << uid << ")\n";
             }
 
             //Connects User with a Room 
@@ -273,6 +291,7 @@ namespace conclave {
                 std::string name = data.substr(0, sep);
                 std::string password = data.substr(sep + 1);
                 ID rid = generate_new_roomID();
+                std::lock_guard<std::mutex> lock(room_manager);
                 rooms.emplace(rid, Room(name, password));
                 std::cout << "[ROOM] Created '" << name << "' (ID: " << rid << ")" << std::endl;
                 send_room_list(private_fd);
@@ -287,6 +306,7 @@ namespace conclave {
                  std::string pass(cmd.begin() + 1 + sizeof(ID), cmd.end());
                 
                 if (rooms.contains(target_room) && verify_room_access(target_room, pass)) {
+                    std::lock_guard<std::mutex> lock(room_manager);
                     rooms.erase(target_room);
                     send_room_list(private_fd);
                 }
@@ -328,6 +348,20 @@ namespace conclave {
                 send_message_fd(private_fd, ack);
             }
 
+            inline void connect_CMD(SecureBuffer<> &cmd) {
+                ID uid = generate_new_uid(cmd.data()+1, cmd.size()-1);
+                users.emplace(uid, -1);
+                std::cout << "[INITIALIZE] Set UID: " << uid << " awaiting confirmation\n";
+                uid = htonl(uid);
+                std::vector<uint8_t> msg;
+                msg.push_back(static_cast<uint8_t>(MessageType::ACK)); // MsgType (3)
+                msg.push_back(0);
+                
+                msg.insert(msg.end(), reinterpret_cast<uint8_t*>(&uid), reinterpret_cast<uint8_t*>(&uid) + 4);
+                msg.insert(msg.end(), cmd.begin(), cmd.end());
+                send_message_fd(private_fd, msg);
+            }
+
             /*
             *   Executes a Command on the server
             *   Command Structure: [CMD(1)] [Details(N)]
@@ -365,16 +399,7 @@ namespace conclave {
                     break;
                     case Commands::CONNECT: {
                         if (cmd.size() < 2) return;
-                        std::cout << "[CONNECT] Recieved Connect Request\n";
-                        ID uid = generate_new_uid(cmd.data()+1, cmd.size()-1);
-                        users.emplace(uid, -1);
-                        uid = htonl(uid);
-                        std::vector<uint8_t> msg;
-                        msg.push_back(static_cast<uint8_t>(MessageType::ACK));
-                        //msg.push_back(0);
-                        msg.insert(msg.end(), reinterpret_cast<uint8_t*>(&uid), reinterpret_cast<uint8_t*>(&uid) + 4);
-                        msg.insert(msg.end(), cmd.begin(), cmd.end());
-                        send_message_fd(private_fd, msg);
+                        connect_CMD(cmd);
                     } break;
                     case Commands::VERIFY:
                         if (cmd.size() < 1 + sizeof(ID) + sizeof(ID)) return;
@@ -469,6 +494,7 @@ namespace conclave {
             
             if (type == MessageType::MSG) {
                 send_message(buffer);
+                last_seen[fd] = std::chrono::steady_clock::now();
             } else if (type == MessageType::CMD) {
                 if (buffer.size() < 2) return; // Need at least [Type][Opcode]
                 
@@ -480,6 +506,62 @@ namespace conclave {
                 std::cout << "[WARN] Unknown MessageType: " << (int)type << std::endl;
             }
         }
+
+        void pending_route() {
+            auto now = std::chrono::steady_clock::now();
+
+            std::lock_guard<std::recursive_mutex> lock(add_user);
+            for (auto it = pending_auth.begin(); it != pending_auth.end();) {
+                if (now - it->second > std::chrono::seconds(2)) {
+                    close_fd(it->first);
+                    it = pending_auth.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        void room_route() {
+            std::vector<ID> empty_rooms;
+            empty_rooms.reserve(rooms.size());
+            for (auto it = rooms.begin(); it != rooms.end(); ++it) {
+                Room& room = it->second;
+                if (room.users.empty()) {
+                    empty_rooms.emplace_back(it->first);
+                }
+            }
+        
+    
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+
+            for (auto id : empty_rooms) {
+                if (rooms[id].users.empty()) {
+                    std::lock_guard<std::mutex> lock(room_manager);
+                    rooms.erase(id);    
+                }
+            }
+        }
+
+        void user_route() {
+            auto now = std::chrono::steady_clock::now();
+            std::lock_guard<std::recursive_mutex> lock(add_user);
+            
+            for (auto it = _users.begin(); it != _users.end(); ) {
+                FDESC fd = it->first;
+                if (now - last_seen[fd] > std::chrono::seconds(60)) {
+                    std::cout << "[REAPER] Evicting zombie user on FD " << fd << "\n";
+                    int uid = it->second;
+                    
+                    // Clean up the maps
+                    _users.erase(it++); 
+                    users.erase(uid);
+                    close_fd(fd);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
 
         public:
             LocServ(int port = 12578) {
@@ -509,7 +591,8 @@ namespace conclave {
 
             void run_server() {
                 epoll_event event{}, events[MAX_EVENTS];
-
+                auto last_run = std::chrono::steady_clock::now() - std::chrono::seconds(30);
+                // Initialize master sockets in epoll
                 for (int i = 0; i < 2; ++i) {
                     event.events = EPOLLIN;
                     event.data.fd = socket_descriptor[i];
@@ -517,11 +600,30 @@ namespace conclave {
                         throw std::runtime_error("Failed to add master socket to epoll");
                 }
 
+                std::cout << "[SYSTEM] Conclave Core live. Reaper active." << std::endl;
+
                 while (true) {
-                    int num_ready = epoll_wait(event_manager, events, MAX_EVENTS, -1);
+                    // Change -1 to 1000 (1 second timeout)
+                    int num_ready = epoll_wait(event_manager, events, MAX_EVENTS, 1000);
+
                     if (num_ready < 0) {
-                        if (errno == EINTR) continue; // Interrupted by signal — retry
+                        if (errno == EINTR) continue; 
                         throw std::runtime_error("epoll_wait failed");
+                    }
+
+                    // --- HOUSEKEEPING BLOCK ---
+                    if (num_ready == 0) {
+                        auto now = std::chrono::steady_clock::now();
+                        
+                        pending_route(); 
+
+                        // Heavy Lifting: Only run these every 30s
+                        if (now - last_run >= std::chrono::seconds(30)) {
+                            user_route();    
+                            room_route();
+                            last_run = now;
+                        }
+                        continue;
                     }
 
                     for (int i = 0; i < num_ready; ++i) {
@@ -536,12 +638,15 @@ namespace conclave {
                                 parse_message(current_fd);
                             } catch (const std::exception& e) {
                                 std::cerr << "[ERROR] FD " << current_fd << ": " << e.what() << std::endl;
+                                
                                 if (current_fd == private_fd) {
                                     private_fd = -1;
                                     std::cout << "[CONTROL] Python bridge disconnected." << std::endl;
                                 }
-                                // end_connectionFD handles EPOLL_CTL_DEL + close
+                                
+                                // Cleanup maps and close socket
                                 end_connectionFD(current_fd);
+                                last_seen.erase(current_fd); 
                             }
                         }
                     }

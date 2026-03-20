@@ -20,34 +20,36 @@
     </div>
 
 <script>
-    const urlParams = new URLSearchParams(window.location.search);
-    const roomId = parseInt(urlParams.get('id'));
-    const tokenB64 = urlParams.get('token');
+    const API_BASE = window.location.origin;
+    const token = sessionStorage.getItem('conclave_token');
+    const roomId = parseInt(window.location.pathname.split('=')[1]);
     const log = document.getElementById('log');
 
     document.getElementById('header').innerText = `SEGMENT_ID: 0x${roomId.toString(16)}`;
 
-    // CONNECT TO WEBSOCKIFY PROXY
+    // FIX: Use hostname, not origin
     const socket = new WebSocket(`ws://${window.location.hostname}:8080`);
     socket.binaryType = 'arraybuffer';
 
     socket.onopen = () => {
         printLog("[SYSTEM] Connected to Proxy. Sending HMAC Token...");
         
-        // Prepare Binary Token: [4B Length][72B Token Data]
-        const rawToken = Uint8Array.from(atob(tokenB64), c => c.charCodeAt(0));
+        // FIX: Variable name 'token'
+        const rawToken = Uint8Array.from(atob(token), c => c.charCodeAt(0));
         const packet = new Uint8Array(4 + rawToken.length);
-        new DataView(packet.buffer).setUint32(0, rawToken.length, false); // Length
+        new DataView(packet.buffer).setUint32(0, rawToken.length, false); 
         packet.set(rawToken, 4);
         
         socket.send(packet);
     };
 
     socket.onmessage = (event) => {
-        // Simple string decoder for your C++ MSG type
+        // Decoding: Skip the 4B Length + 1B Type
         const decoded = new TextDecoder().decode(event.data.slice(5)); 
         printLog(`> ${decoded}`);
     };
+
+socket.onerror = (err) => printLog("[ERROR] Connection failed. Check Websockify.");
 
     function send() {
         const text = document.getElementById('msg').value;

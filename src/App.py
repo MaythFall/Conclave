@@ -50,10 +50,11 @@ def ack_router(ack_type: int, data: bytes):
     data[0] is AckType (Connect=0, Join=1)
     """
     print(f"[ACK] Type: {ack_type}")
+
     if ack_type == 0: # Connect Ack (Reserved UID for a Tab)
         # C++ sends: [AckType(1)][UID(4)][TabID(N)]
         uid = struct.unpack('!I', data[0:4])[0]
-        ack_id = data[4:].decode('utf-8')
+        ack_id = data[5:].decode('utf-8')
         print(f"Trying to connect user on Tab: {ack_id}")
         if ack_id in user_queue:
             print(f"[ACK] Reserved UID {uid} for TAB: {ack_id}")
@@ -241,7 +242,7 @@ async def create_conclave_token(tab_id: str):
         await cpp_writer.drain()
 
         await asyncio.wait_for(ack_event.wait(), timeout=5.0)
-
+        user_queue.pop(tab_id)
         uid = tab2u.pop(tab_id)
         message = struct.pack('!I', uid) + tab_id.encode('utf-8')
 
@@ -253,6 +254,27 @@ async def create_conclave_token(tab_id: str):
     except asyncio.TimeoutError:
         user_queue.pop(tab_id, None)
         return {"status": "error", "message": "Core timeout during UID assignment"}
+
+@app.get('/status')
+async def connection_status():
+    global cpp_writer
+    if cpp_writer is None:
+        raise HTTPException(status_code=425, detail="Connection is not established")
+    return True
+
+@app.post('/disconnect')
+async def disconnect_user(uid: int):
+    global cpp_writer
+    if not cpp_writer:
+        return
+
+    print(f"[DISCONNECT] Disconnecting User: {uid}")
+    
+    payload = b'\x04' + struct.pack('!I', uid)
+    msg = format_conclave_msg(1, payload)
+    
+    cpp_writer.write(msg)
+    await cpp_writer.drain()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

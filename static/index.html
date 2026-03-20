@@ -100,14 +100,32 @@
     }
     }
 
+    // Utility for the "Force Wait"
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
     async function registerUser() {
         try {
+            // Poll for status until the Bridge is actually ready
+            let ready = false;
+            while (!ready) {
+                try {
+                    const check = await fetch(`${API_BASE}/status`);
+                    if (check.ok) ready = true;
+                } catch (e) {
+                    console.log("Waiting for Bridge...");
+                    await sleep(500); // Wait 500ms before retrying
+                }
+            }
+
             const tokenRes = await fetch(`${API_BASE}/get-token?tab_id=${tabId}`);
             const tokenB64 = await tokenRes.json();
-            console.log("Captured Token", tokenB64);
-
-            sessionStorage.setItem('conclave_token', tokenB64);
-            return tokenB64
+            
+            // Ensure the token is a string, not the whole JSON object
+            const token = (typeof tokenB64 === 'object') ? tokenB64.token : tokenB64;
+            
+            sessionStorage.setItem('conclave_token', token);
+            console.log("Access Token Synchronized.");
+            return token;
         } catch(err) {
             console.error("Token Error:", err);
         }
@@ -118,6 +136,20 @@
     }
     refreshRooms();
     setInterval(refreshRooms, 5000);
+
+    window.onbeforeunload = () => {
+        const token = sessionStorage.getItem('conclave_token');
+        if (!token) return;
+
+        const binaryData = atob(token);
+        const uid = ((binaryData.charCodeAt(0) << 24) | 
+                    (binaryData.charCodeAt(1) << 16) | 
+                    (binaryData.charCodeAt(2) << 8)  | 
+                    binaryData.charCodeAt(3)) >>> 0;
+
+        // This is guaranteed to finish even after the tab closes
+        navigator.sendBeacon(`${API_BASE}/disconnect?uid=${uid}`);
+    };
 </script>
 </body>
 </html>

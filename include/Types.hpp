@@ -89,7 +89,7 @@ namespace conclave {
         }
 
     };
-    using ID = int;
+    using ID = uint32_t;
     using FDESC = int;
 
     enum class MessageType : uint8_t {
