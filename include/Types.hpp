@@ -105,7 +105,8 @@ namespace conclave {
         CREATE,
         DESTROY,
         DISCONNECT,
-        CONNECT
+        CONNECT,
+        VERIFY
     };
 
     struct Room {

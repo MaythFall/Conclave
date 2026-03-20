@@ -2,36 +2,76 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Conclave | Segment Active</title>
+    <title>Conclave | Active Segment</title>
     <style>
-        body { font-family: 'Courier New', monospace; background: #0a0a0a; color: #00ff41; padding: 40px; }
-        .terminal { border: 1px solid #00ff41; padding: 20px; box-shadow: 0 0 15px #00ff41; min-height: 400px; }
-        .input-area { margin-top: 20px; display: flex; }
-        input { background: #000; border: 1px solid #00ff41; color: #00ff41; flex-grow: 1; padding: 10px; }
+        body { font-family: 'Courier New', monospace; background: #000; color: #00ff41; padding: 20px; overflow: hidden; }
+        .terminal { border: 1px solid #00ff41; height: 70vh; padding: 20px; overflow-y: auto; background: rgba(0,20,0,0.2); }
+        .input-line { display: flex; margin-top: 20px; border: 1px solid #00ff41; }
+        input { background: transparent; border: none; color: #00ff41; flex-grow: 1; padding: 15px; outline: none; }
+        button { background: #00ff41; color: #000; border: none; padding: 0 25px; font-weight: bold; cursor: pointer; }
     </style>
 </head>
 <body>
-    <h2 id="roomTitle">ACCESSING_SEGMENT...</h2>
-    <div class="terminal" id="chatLog">
-        [SYSTEM] Handshake initiated...<br>
-        [SYSTEM] Awaiting Divalia encryption layer...
-    </div>
-    <div class="input-area">
-        <input type="text" id="msg" placeholder="Type encrypted message...">
-        <button style="background:#00ff41; border:none; padding:10px;" onclick="send()">SEND</button>
+    <h2 id="header">ACCESSING_SEGMENT...</h2>
+    <div class="terminal" id="log"></div>
+    <div class="input-line">
+        <input type="text" id="msg" placeholder="Command..." autofocus>
+        <button onclick="send()">SEND</button>
     </div>
 
-    <script>
-        const urlParams = new URLSearchParams(window.location.search);
-        const roomId = urlParams.get('id');
-        document.getElementById('roomTitle').innerText = `SEGMENT_ID: ${roomId}`;
+<script>
+    const urlParams = new URLSearchParams(window.location.search);
+    const roomId = parseInt(urlParams.get('id'));
+    const tokenB64 = urlParams.get('token');
+    const log = document.getElementById('log');
 
-        function send() {
-            const text = document.getElementById('msg').value;
-            // This will eventually go to your Public Port 12578!
-            console.log("Encrypted Payload:", text);
-            document.getElementById('msg').value = '';
-        }
-    </script>
+    document.getElementById('header').innerText = `SEGMENT_ID: 0x${roomId.toString(16)}`;
+
+    // CONNECT TO WEBSOCKIFY PROXY
+    const socket = new WebSocket(`ws://${window.location.hostname}:8080`);
+    socket.binaryType = 'arraybuffer';
+
+    socket.onopen = () => {
+        printLog("[SYSTEM] Connected to Proxy. Sending HMAC Token...");
+        
+        // Prepare Binary Token: [4B Length][72B Token Data]
+        const rawToken = Uint8Array.from(atob(tokenB64), c => c.charCodeAt(0));
+        const packet = new Uint8Array(4 + rawToken.length);
+        new DataView(packet.buffer).setUint32(0, rawToken.length, false); // Length
+        packet.set(rawToken, 4);
+        
+        socket.send(packet);
+    };
+
+    socket.onmessage = (event) => {
+        // Simple string decoder for your C++ MSG type
+        const decoded = new TextDecoder().decode(event.data.slice(5)); 
+        printLog(`> ${decoded}`);
+    };
+
+    function send() {
+        const text = document.getElementById('msg').value;
+        if (!text) return;
+
+        // Binary MSG format: [Length(4B)][Type(1B:0x00)][RoomID(4B)][Payload]
+        const encoder = new TextEncoder();
+        const payload = encoder.encode(text);
+        const packet = new Uint8Array(4 + 1 + 4 + payload.length);
+        const view = new DataView(packet.buffer);
+        
+        view.setUint32(0, 1 + 4 + payload.length, false); // Total Body Length
+        packet[4] = 0x00; // MessageType::MSG
+        view.setUint32(5, roomId, false); // Destination Room
+        packet.set(payload, 9);
+
+        socket.send(packet);
+        document.getElementById('msg').value = '';
+    }
+
+    function printLog(txt) {
+        log.innerHTML += `<div>${txt}</div>`;
+        log.scrollTop = log.scrollHeight;
+    }
+</script>
 </body>
 </html>

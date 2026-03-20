@@ -224,25 +224,32 @@ namespace conclave {
                 ID target_room, target_user;
                 memcpy(&target_room, cmd.data() + 1, sizeof(ID));
                 memcpy(&target_user, cmd.data() + 5, sizeof(ID));
-
                 target_room = ntohl(target_room);
                 target_user = ntohl(target_user);
+                std::cout << "Room Id: " << target_room << " User Id: " << target_user << std::endl;
 
-                if (!rooms.contains(target_room)) return;
-                uint8_t* pass_ptr = cmd.data() + 9;
-                size_t pass_len = cmd.size() - 9;
+                if (!rooms.contains(target_room)) {
+                    std::cout << "[WARN] Room does not exist ID: " << target_room << std::endl;
+                    return;
+                }
+                std::string pass(cmd.begin()+9, cmd.end());
 
-                if (verify_room_access(target_room, pass_ptr, pass_len)) {
+                if (verify_room_access(target_room, pass)) {
                     rooms.at(target_room).users.emplace(target_user);
+                    std::cout << "Added User: " << target_user << " to room: " << target_room << std::endl;
                     user2room[target_user] = target_room;
 
-                    std::vector<uint8_t> ack(5);
-                    ack[0] = static_cast<uint8_t>(MessageType::ACK);
-                    uint32_t net_uid = htonl(target_user);
-                    memcpy(ack.data() + 1, &net_uid, sizeof(uint32_t));
+                    // Correct Ack Structure: [ACK Type][UID (4 bytes)]
+                    std::vector<uint8_t> ack(6);
+                    ack[0] = static_cast<uint8_t>(MessageType::ACK); 
+                    ack[1] = static_cast<uint8_t>(1); //ACK Type JOIN
+                    std::cout << "C++ Message Type: " << ack[0] << " ACK Type: " << ack[1] << std::endl;
+                    uint32_t net_uid = htonl(target_user); // Must be Big-Endian for Python struct.unpack
+                    memcpy(ack.data() + 2, reinterpret_cast<uint8_t*>(&net_uid), 4);
                     
                     send_message_fd(private_fd, ack);
-                    std::cout << "[ACK] User " << target_user << " joined Room " << target_room << std::endl;
+                } else {
+                    std::cout << "Wrong Password | Expected: " << rooms[target_room].password << "Given: " << pass << std::endl;
                 }
             }
 
@@ -279,7 +286,7 @@ namespace conclave {
                 // Extraction of password for verification
                  std::string pass(cmd.begin() + 1 + sizeof(ID), cmd.end());
                 
-                if (rooms.contains(target_room) && verify_room_access(target_room, reinterpret_cast<uint8_t*>(pass.data()), pass.length())) {
+                if (rooms.contains(target_room) && verify_room_access(target_room, pass)) {
                     rooms.erase(target_room);
                     send_room_list(private_fd);
                 }
@@ -293,6 +300,34 @@ namespace conclave {
                 end_connection(uid);
             }
 
+            inline void verify_CMD(SecureBuffer<uint8_t> &cmd) {
+                ID target_room, target_user;
+                memcpy(&target_room, cmd.data() + 1, sizeof(ID));
+                memcpy(&target_user, cmd.data() + 5, sizeof(ID));
+                target_room = ntohl(target_room);
+                target_user = ntohl(target_user);
+                std::cout << "Room Id: " << target_room << " User Id: " << target_user << std::endl;
+
+                if (!rooms.contains(target_room)) {
+                    std::cout << "[WARN] Room does not exist ID: " << target_room << std::endl;
+                    return;
+                }
+
+                // Correct Ack Structure: [ACK Type][UID (4 bytes)] [Confirm(1)]
+                std::vector<uint8_t> ack(7);
+                ack[0] = static_cast<uint8_t>(MessageType::ACK); 
+                ack[1] = static_cast<uint8_t>(2); //ACK Type JOIN
+                std::cout << "C++ Message Type: " << int(ack[0]) << " ACK Type: " << int(ack[1]) << std::endl;
+                uint32_t net_uid = htonl(target_user); // Must be Big-Endian for Python struct.unpack
+                memcpy(ack.data() + 2, reinterpret_cast<uint8_t*>(&net_uid), 4);
+                if (verify_room_access(target_room, target_user)) ack.back() = 0;
+                else {
+                    std::cout << "User: " << target_user << "not allowed\n";
+                    ack.back() = 1;
+                }
+                send_message_fd(private_fd, ack);
+            }
+
             /*
             *   Executes a Command on the server
             *   Command Structure: [CMD(1)] [Details(N)]
@@ -302,15 +337,14 @@ namespace conclave {
             *   DESTROY: [CMD(1)][RoomId(4)][Password(N)]
             *   DISCONNECT: [CMD(1)] [UserId(4)]
             *   CONNECT: [CMD(1)] [TabId(N)]
+            *   VERIFY: [CMD(1)] [RoomId(4)] [UserId(4)]
             */
             void execute_command(SecureBuffer<uint8_t>& cmd) {
                 if (cmd.empty()) return;
                 Commands command = static_cast<Commands>(cmd.front());
                 switch (command) {
                     case Commands::JOIN:
-                        std::cout << "Received Join Request\n";
                         if (cmd.size() < 1 + sizeof(ID) + sizeof(ID)) return;
-                        
                         join_room_CMD(cmd);
                     break;
                     case Commands::LEAVE:
@@ -329,27 +363,36 @@ namespace conclave {
                         if (cmd.size() < 1 + sizeof(ID)) return;
                         disconnect_CMD(cmd);
                     break;
-                    case Commands::CONNECT:
+                    case Commands::CONNECT: {
                         if (cmd.size() < 2) return;
-                        int uid = generate_new_uid(cmd.data()+1, cmd.size()-1);
+                        std::cout << "[CONNECT] Recieved Connect Request\n";
+                        ID uid = generate_new_uid(cmd.data()+1, cmd.size()-1);
                         users.emplace(uid, -1);
                         uid = htonl(uid);
                         std::vector<uint8_t> msg;
-                        msg.emplace_back(static_cast<uint8_t>(MessageType::ACK));
-                        msg.emplace_back(0);
+                        msg.push_back(static_cast<uint8_t>(MessageType::ACK));
+                        //msg.push_back(0);
                         msg.insert(msg.end(), reinterpret_cast<uint8_t*>(&uid), reinterpret_cast<uint8_t*>(&uid) + 4);
-                        msg.insert(msg.end(), cmd.begin()+1, cmd.end());
+                        msg.insert(msg.end(), cmd.begin(), cmd.end());
                         send_message_fd(private_fd, msg);
+                    } break;
+                    case Commands::VERIFY:
+                        if (cmd.size() < 1 + sizeof(ID) + sizeof(ID)) return;
+                        verify_CMD(cmd);
                     break;
                 }
             }
-
-            bool verify_room_access(ID roomId, uint8_t *password, int len) {
+            
+            bool verify_room_access(ID roomId, std::string &pass) {
                 //temp password matching
                 Room& room = rooms.at(roomId);
-                std::string pass(reinterpret_cast<char*>(password), len);
                 if (room.password.empty() || (pass == room.password)) return true;
                 return false;
+            }
+
+            bool verify_room_access(ID roomId, ID uid) {
+                Room& room = rooms.at(roomId);
+                return room.users.contains(uid);
             }
 
             // Fan-out a message buffer to every user in a room.
