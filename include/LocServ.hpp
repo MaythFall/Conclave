@@ -13,6 +13,7 @@
 #include <iostream>
 #include <random>
 #include "CC_SHA256.hpp"
+#include <format>
 
 namespace conclave {
 
@@ -97,7 +98,7 @@ namespace conclave {
                     return;
                 }
 
-                std::lock_guard<std::mutex> lock(add_user);
+                std::lock_guard<std::recursive_mutex> lock(add_user);
                 if constexpr (Private) {
                     private_fd = new_fd;
                     std::cout << "[CONTROL] Python Bridge linked on FD " << new_fd << std::endl;
@@ -147,11 +148,8 @@ namespace conclave {
                 buffer.resize(size);
                 if (!read_exact(fd, buffer.data(), size))
                     throw std::runtime_error("Connection closed reading body from fd " + std::to_string(fd));
-                if (pending_auth.contains(fd)) verify_connection(fd, buffer);
-                else {
-                    send_message(buffer);
-                }
-                
+                if (pending_auth.contains(fd)) verify_connection(fd, buffer); 
+                else if (_users.contains(fd)) return;
             }
 
             void verify_connection(FDESC fd, SecureBuffer<uint8_t>& buffer) {
@@ -181,7 +179,6 @@ namespace conclave {
                         std::cout << "[AUTH] User " << uid << " promoted to active socket.\n";
                     } else {
                         std::cerr << "[SECURITY] UID " << uid << " not in pending state.\n";
-                        close_fd(fd);
                     }
                 } else {
                     std::cerr << "[SECURITY] HMAC Mismatch on FD " << fd << "\n";
@@ -237,50 +234,79 @@ namespace conclave {
                 std::cout << "[CLEANUP] Resources released for FD: " << fd << " (UID: " << uid << ")\n";
             }
 
+            void broadcast_system_msg(ID room_id, const std::string& text) {
+                if (!rooms.contains(room_id)) return;
+
+                std::thread([this, r = room_id, t = text] {
+                    // Packet: [SenderUID(4:Zeros)][Text(N)]
+                    std::vector<uint8_t> payload(4, 0); // 4 bytes of zeros
+                    payload.insert(payload.end(), t.begin(), t.end());
+                    
+                    // 250ms is usually enough for the browser to init the WebSocket
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    
+                    send_message_room(0, r, payload);
+                }).detach();
+            }
+
             //Connects User with a Room 
-            void join_room_CMD(SecureBuffer<uint8_t> &cmd) {
+           void join_room_CMD(SecureBuffer<uint8_t> &cmd) {
                 ID target_room, target_user;
                 memcpy(&target_room, cmd.data() + 1, sizeof(ID));
                 memcpy(&target_user, cmd.data() + 5, sizeof(ID));
                 target_room = ntohl(target_room);
                 target_user = ntohl(target_user);
-                std::cout << "Room Id: " << target_room << " User Id: " << target_user << std::endl;
 
-                if (!rooms.contains(target_room)) {
-                    std::cout << "[WARN] Room does not exist ID: " << target_room << std::endl;
-                    return;
-                }
-                std::string pass(cmd.begin()+9, cmd.end());
+                if (!rooms.contains(target_room)) return;
+
+                std::string pass(cmd.begin() + 9, cmd.end());
 
                 if (verify_room_access(target_room, pass)) {
                     rooms.at(target_room).users.emplace(target_user);
-                    std::cout << "Added User: " << target_user << " to room: " << target_room << std::endl;
                     user2room[target_user] = target_room;
 
-                    // Correct Ack Structure: [ACK Type][UID (4 bytes)]
+                    // 1. Send ACK back to the bridge
                     std::vector<uint8_t> ack(6);
                     ack[0] = static_cast<uint8_t>(MessageType::ACK); 
-                    ack[1] = static_cast<uint8_t>(1); //ACK Type JOIN
-                    std::cout << "C++ Message Type: " << ack[0] << " ACK Type: " << ack[1] << std::endl;
-                    uint32_t net_uid = htonl(target_user); // Must be Big-Endian for Python struct.unpack
-                    memcpy(ack.data() + 2, reinterpret_cast<uint8_t*>(&net_uid), 4);
-                    
+                    ack[1] = 1; // JOIN_ACK
+                    uint32_t net_uid = htonl(target_user);
+                    memcpy(ack.data() + 2, &net_uid, 4);
                     send_message_fd(private_fd, ack);
-                } else {
-                    std::cout << "Wrong Password | Expected: " << rooms[target_room].password << "Given: " << pass << std::endl;
+
+                    // 2. Broadcast Join Notification
+                    std::string note = std::format("OPERATOR [{}] LINKED TO SEGMENT. ({} TOTAL)", 
+                                                    target_user, rooms[target_room].users.size());
+                    broadcast_system_msg(target_room, note);
                 }
             }
 
             //Removes User from a Room
             void leave_room_CMD(SecureBuffer<uint8_t> &cmd) {
-                ID target_room, target_user;
-                memcpy(&target_room, cmd.data() + 1, sizeof(ID));
-                memcpy(&target_user,  cmd.data() + 1 + sizeof(ID), sizeof(ID));
-                target_room = ntohl(target_room);
-                target_user = ntohl(target_user);
-                if (!rooms.contains(target_room)) return;
-                rooms.at(target_room).users.erase(target_user);
-                user2room.erase(target_user);
+                ID target_room = 0, target_user = 0;
+
+                if (cmd.size() == 1 + sizeof(ID)) {
+                    memcpy(&target_user, cmd.data() + 1, sizeof(ID));
+                    target_user = ntohl(target_user);
+                    if (!user2room.contains(target_user)) return;
+                    target_room = user2room[target_user];
+                } else if (cmd.size() >= 1 + (sizeof(ID) * 2)) {
+                    memcpy(&target_room, cmd.data() + 1, sizeof(ID));
+                    memcpy(&target_user, cmd.data() + 1 + sizeof(ID), sizeof(ID));
+                    target_room = ntohl(target_room);
+                    target_user = ntohl(target_user);
+                }
+
+                if (target_room != 0 && rooms.contains(target_room)) {
+                    rooms.at(target_room).users.erase(target_user);
+                    user2room.erase(target_user);
+
+                    // Broadcast Leave Notification
+                    std::string note = std::format("OPERATOR [{}] DISCONNECTED. ({} REMAINING)", 
+                                                    target_user, rooms[target_room].users.size());
+                    broadcast_system_msg(target_room, note);
+                    
+                    std::cout << "[CMD] Removed User: " << target_user << " from Room: " << target_room << std::endl;
+                }
             }
 
             void create_room_CMD(SecureBuffer<uint8_t> &cmd) {
@@ -382,7 +408,7 @@ namespace conclave {
                         join_room_CMD(cmd);
                     break;
                     case Commands::LEAVE:
-                        if (cmd.size() < 1 + sizeof(ID) + sizeof(ID)) return;
+                        if (cmd.size() < 1 + sizeof(ID)) return;
                         leave_room_CMD(cmd);
                     break;
                     case Commands::CREATE:
@@ -422,7 +448,7 @@ namespace conclave {
 
             // Fan-out a message buffer to every user in a room.
             // Spawns a detached thread per user; each thread owns its own copy of the data.
-            void send_message_room(ID room_id, std::vector<uint8_t>& payload) {
+            void send_message_room(FDESC fd, ID room_id, std::vector<uint8_t>& payload) {
                 if (!rooms.contains(room_id)) return;
                 Room& room = rooms.at(room_id);
 
@@ -432,8 +458,9 @@ namespace conclave {
                 memcpy(packet.data(), &net_len, 4);
                 memcpy(packet.data() + 4, payload.data(), payload.size());
 
+                std::cout << "[MSG] Sending message to Room ID: " << room_id << std::endl;
                 for (auto uid : room.users) {
-                    if (!users.contains(uid)) continue;
+                    if (!users.contains(uid) || (fd == 0 ? false : (_users[fd] == uid))) continue;
                     int ufd = users.at(uid);
                     // Each thread gets its own copy so lifetime is self-contained
                     std::thread([ufd, pkt = packet]() {
@@ -448,16 +475,23 @@ namespace conclave {
                 }
             }
 
-            void send_message(SecureBuffer<uint8_t>& msg) {
-                if (msg.size() < 4) return;
-                uint32_t dest;
-                memcpy(&dest, msg.data(), sizeof(uint32_t));
-                dest = ntohl(dest);
+            void send_message(FDESC &fd, SecureBuffer<uint8_t>& msg) {
+                if (msg.size() < 9) return; // Type(1) + RoomID(4) + UID(4)
+    
+                uint32_t dest_room, sender_uid;
+                memcpy(&dest_room, msg.data() + 1, 4);
+                memcpy(&sender_uid, msg.data() + 5, 4); // Extract the UID the client sent
+                
+                dest_room = ntohl(dest_room);
+                // sender_uid is already in network byte order from JS
 
-                // The first 4 bytes are the destination room ID, not payload length.
-                // Build the actual payload as everything after the room ID.
-                std::vector<uint8_t> payload(msg.begin() + 4, msg.end());
-                send_message_room(dest, payload);
+                // Broadcast packet: [SenderUID(4)][Payload(NB)]
+                std::vector<uint8_t> broadcast_payload;
+                uint8_t* uid_ptr = reinterpret_cast<uint8_t*>(&sender_uid);
+                broadcast_payload.insert(broadcast_payload.end(), uid_ptr, uid_ptr + 4);
+                broadcast_payload.insert(broadcast_payload.end(), msg.begin() + 9, msg.end());
+
+                send_message_room(fd, dest_room, broadcast_payload);
             }
 
             // Send a framed packet directly to a single fd (e.g. the Python bridge)
@@ -493,7 +527,8 @@ namespace conclave {
             MessageType type = static_cast<MessageType>(buffer.front());
             
             if (type == MessageType::MSG) {
-                send_message(buffer);
+                std::cout << "[MSG] Received from FD: " << fd << std::endl;
+                send_message(fd, buffer);
                 last_seen[fd] = std::chrono::steady_clock::now();
             } else if (type == MessageType::CMD) {
                 if (buffer.size() < 2) return; // Need at least [Type][Opcode]
@@ -591,7 +626,8 @@ namespace conclave {
 
             void run_server() {
                 epoll_event event{}, events[MAX_EVENTS];
-                auto last_run = std::chrono::steady_clock::now() - std::chrono::seconds(30);
+                //auto last_run = std::chrono::steady_clock::now() - std::chrono::seconds(30);
+                size_t count = 0;
                 // Initialize master sockets in epoll
                 for (int i = 0; i < 2; ++i) {
                     event.events = EPOLLIN;
@@ -611,20 +647,14 @@ namespace conclave {
                         throw std::runtime_error("epoll_wait failed");
                     }
 
-                    // --- HOUSEKEEPING BLOCK ---
-                    if (num_ready == 0) {
-                        auto now = std::chrono::steady_clock::now();
-                        
+                    /*/ --- HOUSEKEEPING BLOCK ---
+                    if ((count & 1048575) == 0) {
+                        std::cout << "HouseKeeping\n";
                         pending_route(); 
-
-                        // Heavy Lifting: Only run these every 30s
-                        if (now - last_run >= std::chrono::seconds(30)) {
-                            user_route();    
-                            room_route();
-                            last_run = now;
-                        }
+                        user_route();    
+                        room_route();
                         continue;
-                    }
+                    }*/
 
                     for (int i = 0; i < num_ready; ++i) {
                         int current_fd = events[i].data.fd;
@@ -650,6 +680,7 @@ namespace conclave {
                             }
                         }
                     }
+                    ++count;
                 }
             }
     };

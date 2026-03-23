@@ -2,78 +2,144 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Conclave | Active Segment</title>
+    <title>CONCLAVE // TERMINAL</title>
     <style>
-        body { font-family: 'Courier New', monospace; background: #000; color: #00ff41; padding: 20px; overflow: hidden; }
-        .terminal { border: 1px solid #00ff41; height: 70vh; padding: 20px; overflow-y: auto; background: rgba(0,20,0,0.2); }
-        .input-line { display: flex; margin-top: 20px; border: 1px solid #00ff41; }
-        input { background: transparent; border: none; color: #00ff41; flex-grow: 1; padding: 15px; outline: none; }
-        button { background: #00ff41; color: #000; border: none; padding: 0 25px; font-weight: bold; cursor: pointer; }
+        :root {
+            --cobalt: #38bdf8;
+            --carbon: #0f172a;
+            --steel: #1e293b;
+            --border: #334155;
+            --text: #f8fafc;
+        }
+
+        body { 
+            font-family: 'JetBrains Mono', monospace; 
+            background: var(--carbon); color: var(--text); 
+            margin: 0; height: 100vh; display: flex; flex-direction: column;
+        }
+
+        header {
+            background: var(--steel); border-bottom: 2px solid var(--border);
+            padding: 12px 24px; display: flex; justify-content: space-between;
+            font-size: 0.85em; text-transform: uppercase;
+        }
+
+        #log { flex-grow: 1; padding: 24px; overflow-y: auto; background: rgba(0,0,0,0.2); }
+
+        /* Industrial Entry Styles */
+        .entry { margin-bottom: 6px; padding: 4px 10px; border-left: 2px solid transparent; }
+        .entry.self { border-left-color: var(--cobalt); background: rgba(56, 189, 248, 0.03); }
+        .entry.sys { color: #64748b; font-size: 0.8em; }
+
+        .uid { color: var(--cobalt); font-weight: bold; margin-right: 12px; }
+        .self .uid { color: #fff; }
+
+        .input-area {
+            background: var(--steel); border-top: 2px solid var(--border);
+            padding: 15px 20px; display: flex; gap: 10px;
+        }
+
+        input {
+            flex-grow: 1; background: var(--carbon); border: 1px solid var(--border);
+            color: #fff; padding: 12px; font-family: inherit; outline: none;
+        }
+
+        button {
+            background: var(--cobalt); color: #000; border: none;
+            padding: 0 25px; font-weight: 900; cursor: pointer;
+        }
     </style>
 </head>
 <body>
-    <h2 id="header">ACCESSING_SEGMENT...</h2>
-    <div class="terminal" id="log"></div>
-    <div class="input-line">
-        <input type="text" id="msg" placeholder="Command..." autofocus>
-        <button onclick="send()">SEND</button>
+    <header>
+        <div>SEGMENT: <span id="room-id" style="color:var(--cobalt)">0x00</span></div>
+        <div>OPERATOR: <span id="user-id" style="color:var(--cobalt)">0000</span></div>
+        <div id="status">STATUS: LINK_ESTABLISHED</div>
+    </header>
+
+    <div id="log"></div>
+
+    <div class="input-area">
+        <input type="text" id="msg" placeholder="READY FOR INPUT..." autofocus autocomplete="off">
+        <button onclick="send()">TRANSMIT</button>
     </div>
 
 <script>
-    const API_BASE = window.location.origin;
     const token = sessionStorage.getItem('conclave_token');
     const roomId = parseInt(window.location.pathname.split('=')[1]);
     const log = document.getElementById('log');
 
-    document.getElementById('header').innerText = `SEGMENT_ID: 0x${roomId.toString(16)}`;
+    function getUID() {
+        const binaryData = atob(token);
+        return ((binaryData.charCodeAt(0) << 24) | (binaryData.charCodeAt(1) << 16) |
+                (binaryData.charCodeAt(2) << 8)  | binaryData.charCodeAt(3)) >>> 0;
+    }
+    const myUID = getUID();
 
-    // FIX: Use hostname, not origin
+    document.getElementById('room-id').innerText = `0x${roomId.toString(16).toUpperCase()}`;
+    document.getElementById('user-id').innerText = myUID;
+
     const socket = new WebSocket(`ws://${window.location.hostname}:8080`);
     socket.binaryType = 'arraybuffer';
 
     socket.onopen = () => {
-        printLog("[SYSTEM] Connected to Proxy. Sending HMAC Token...");
-        
-        // FIX: Variable name 'token'
         const rawToken = Uint8Array.from(atob(token), c => c.charCodeAt(0));
         const packet = new Uint8Array(4 + rawToken.length);
         new DataView(packet.buffer).setUint32(0, rawToken.length, false); 
         packet.set(rawToken, 4);
-        
         socket.send(packet);
     };
 
     socket.onmessage = (event) => {
-        // Decoding: Skip the 4B Length + 1B Type
-        const decoded = new TextDecoder().decode(event.data.slice(5)); 
-        printLog(`> ${decoded}`);
+        const view = new DataView(event.data);
+        // [4B Length][4B SenderUID][Payload]
+        const senderUid = view.getUint32(4, false); 
+        const text = new TextDecoder().decode(event.data.slice(8)); 
+        addEntry(text, senderUid);
     };
 
-socket.onerror = (err) => printLog("[ERROR] Connection failed. Check Websockify.");
-
     function send() {
-        const text = document.getElementById('msg').value;
+        const input = document.getElementById('msg');
+        const text = input.value;
         if (!text) return;
 
-        // Binary MSG format: [Length(4B)][Type(1B:0x00)][RoomID(4B)][Payload]
-        const encoder = new TextEncoder();
-        const payload = encoder.encode(text);
-        const packet = new Uint8Array(4 + 1 + 4 + payload.length);
+        const payload = new TextEncoder().encode(text);
+        const packet = new Uint8Array(13 + payload.length);
         const view = new DataView(packet.buffer);
         
-        view.setUint32(0, 1 + 4 + payload.length, false); // Total Body Length
-        packet[4] = 0x00; // MessageType::MSG
-        view.setUint32(5, roomId, false); // Destination Room
-        packet.set(payload, 9);
+        view.setUint32(0, 9 + payload.length, false); 
+        packet[4] = 0x00; 
+        view.setUint32(5, roomId, false); 
+        view.setUint32(9, myUID, false);
+        packet.set(payload, 13);
 
         socket.send(packet);
-        document.getElementById('msg').value = '';
+        
+        // --- DISPLAY LOCALLY ---
+        addEntry(text, myUID);
+        input.value = '';
     }
 
-    function printLog(txt) {
-        log.innerHTML += `<div>${txt}</div>`;
+    function addEntry(text, sender) {
+        const div = document.createElement('div');
+        const isSelf = sender === myUID;
+        const isSystem = sender === 0; // UID 0 is the system!
+
+        div.className = `entry ${isSelf ? 'self' : ''} ${isSystem ? 'sys' : ''}`;
+        
+        if (isSystem) {
+            div.innerHTML = `<span class="sys-msg">>> ${text}</span>`;
+            div.style.color = "#64748b"; // Dim gray for system logs
+            div.style.fontStyle = "italic";
+        } else {
+            div.innerHTML = `<span class="uid">[${sender}]</span><span class="txt">${text}</span>`;
+        }
+        
+        log.appendChild(div);
         log.scrollTop = log.scrollHeight;
     }
+
+    document.getElementById('msg').addEventListener('keypress', (e) => { if (e.key === 'Enter') send(); });
 </script>
 </body>
 </html>

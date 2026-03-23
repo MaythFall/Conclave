@@ -33,7 +33,10 @@
 
 <script>
     const API_BASE = window.location.origin;
-    const tabId = crypto.randomUUID();
+    if (!sessionStorage.getItem('conclave_tab_id')) {
+        sessionStorage.setItem('conclave_tab_id', crypto.randomUUID());
+    }
+    const tabId = sessionStorage.getItem('conclave_tab_id');
 
     async function refreshRooms() {
         const res = await fetch(`${API_BASE}/rooms`);
@@ -104,6 +107,12 @@
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
     async function registerUser() {
+        
+        if (sessionStorage.getItem('conclave_token')) {
+            console.log("[SYSTEM] Resuming existing session...");
+            return;
+        }
+        
         try {
             // Poll for status until the Bridge is actually ready
             let ready = false;
@@ -133,23 +142,12 @@
 
     if (sessionStorage.getItem('conclave_token') == null) {
         registerUser();
+    } else {
+        fetch(`${API_BASE}/leave?user_id=${uid}`);
     }
     refreshRooms();
     setInterval(refreshRooms, 5000);
 
-    window.onbeforeunload = () => {
-        const token = sessionStorage.getItem('conclave_token');
-        if (!token) return;
-
-        const binaryData = atob(token);
-        const uid = ((binaryData.charCodeAt(0) << 24) | 
-                    (binaryData.charCodeAt(1) << 16) | 
-                    (binaryData.charCodeAt(2) << 8)  | 
-                    binaryData.charCodeAt(3)) >>> 0;
-
-        // This is guaranteed to finish even after the tab closes
-        navigator.sendBeacon(`${API_BASE}/disconnect?uid=${uid}`);
-    };
 </script>
 </body>
 </html>

@@ -69,10 +69,10 @@ def ack_router(ack_type: int, data: bytes):
             pending_acks[uid].set()
     elif ack_type == 2: #Generic ACK: True
         uid = struct.unpack('!I', data[0:4])[0]
-        print(f"[ACK] User: {uid} Code: {data[-1]}")
+        #print(f"[ACK] User: {uid} Code: {data[-1]}")
         if uid in gen_acks:
             if data[-1] == 0:  
-                print(f"Verified Access to ROOM for UID: {uid}")
+                print(f"[ACK] Verified Access to ROOM for UID: {uid}")
                 gen_acks[uid].set()
             
         
@@ -166,7 +166,6 @@ async def room(roomId: int, uid: int = Form(...)): # Look for 'uid' in the POST 
         gen_acks.pop(uid, None)
         raise HTTPException(status_code=504, detail="C++ Core timeout.")
 
-    
 
 @app.get("/rooms")
 async def get_rooms():
@@ -215,6 +214,28 @@ async def join_room(roomId: int, user_id: int, password: str):
             raise HTTPException(status_code=403, detail="Access Denied: Invalid credentials or timeout.")
     finally:
         pending_acks.pop(user_id, None)
+
+@app.put("/leave")
+async def leave_room(roomId: int, user_id: int):
+    if not cpp_writer:
+        raise HTTPException(status_code=503, detail="C++ Backend Offline")
+    ack_event = asyncio.Event()
+    pending_acks[user_id] = ack_event
+
+    opcode = b'\x01' # Commands::LEAVE
+    if roomId is None:
+        binary_ids = struct.pack('!I', user_id)
+    else:
+        binary_ids = struct.pack('!I', roomId) + struct.pack('!I', user_id)
+    payload = opcode + binary_ids
+    
+    full_msg = format_conclave_msg(1, payload) # MessageType::CMD
+
+    try:
+        cpp_writer.write(full_msg)
+        await cpp_writer.drain()
+    except:
+        raise HTTPException(status_code=400, detail="Failed to contact main server")
 
 @app.post("/delete-room")
 async def delete_room(roomId: int, room_pw: str):
