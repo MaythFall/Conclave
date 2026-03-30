@@ -10,6 +10,7 @@ import secrets
 import hmac
 import hashlib
 import base64
+from typing import Optional
 
 # --- STATE MANAGEMENT ---
 rooms: dict[int, str] = {}
@@ -216,26 +217,30 @@ async def join_room(roomId: int, user_id: int, password: str):
         pending_acks.pop(user_id, None)
 
 @app.put("/leave")
-async def leave_room(roomId: int, user_id: int):
+async def leave_room(user_id: int, roomId: Optional[int] = None):
     if not cpp_writer:
         raise HTTPException(status_code=503, detail="C++ Backend Offline")
-    ack_event = asyncio.Event()
-    pending_acks[user_id] = ack_event
 
     opcode = b'\x01' # Commands::LEAVE
+    
     if roomId is None:
+        # Just the UID (C++ will look up the room via user2room map)
         binary_ids = struct.pack('!I', user_id)
     else:
+        # RoomID and UID
         binary_ids = struct.pack('!I', roomId) + struct.pack('!I', user_id)
+        
     payload = opcode + binary_ids
-    
-    full_msg = format_conclave_msg(1, payload) # MessageType::CMD
+    full_msg = format_conclave_msg(1, payload)
 
     try:
+        print(f"[CMD] Operator {user_id} requesting segment exit.")
         cpp_writer.write(full_msg)
         await cpp_writer.drain()
-    except:
-        raise HTTPException(status_code=400, detail="Failed to contact main server")
+        return {"status": "success"}
+    except Exception as e:
+        print(f"[ERROR] Leave command failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal Bridge Error")
 
 @app.post("/delete-room")
 async def delete_room(roomId: int, room_pw: str):

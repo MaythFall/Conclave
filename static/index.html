@@ -4,150 +4,260 @@
     <meta charset="UTF-8">
     <title>Conclave | Control Plane</title>
     <style>
-        body { font-family: 'Segoe UI', sans-serif; background: #0a0a0a; color: #e0e0e0; padding: 40px; }
-        .container { max-width: 800px; margin: auto; }
-        h1 { color: #00ffcc; border-bottom: 2px solid #333; }
-        .card { background: #161616; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #222; }
-        input { background: #222; border: 1px solid #444; color: #00ffcc; padding: 10px; border-radius: 4px; }
-        button { background: #00ffcc; color: #000; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-weight: bold; }
-        .room-item { display: flex; justify-content: space-between; padding: 15px; border-bottom: 1px solid #222; }
-        .room-id { color: #666; font-family: monospace; font-size: 0.8em; }
+        :root {
+            --cobalt: #38bdf8;
+            --carbon: #0f172a;
+            --steel: #1e293b;
+            --border: #334155;
+            --text: #f8fafc;
+            --success: #10b981;
+        }
+
+        body { 
+            font-family: 'JetBrains Mono', 'Segoe UI', sans-serif; 
+            background: var(--carbon); 
+            color: var(--text); 
+            padding: 40px; 
+            margin: 0;
+        }
+
+        .container { max-width: 900px; margin: auto; }
+
+        h1 { 
+            color: var(--cobalt); 
+            border-bottom: 2px solid var(--border); 
+            padding-bottom: 10px;
+            letter-spacing: 2px;
+            font-size: 1.5rem;
+        }
+
+        .card { 
+            background: var(--steel); 
+            padding: 25px; 
+            border-radius: 4px; 
+            margin-bottom: 25px; 
+            border: 1px solid var(--border);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+        }
+
+        h3 { margin-top: 0; font-size: 0.9rem; color: #94a3b8; text-transform: uppercase; }
+
+        .input-group { display: flex; gap: 10px; margin-top: 15px; }
+
+        input { 
+            background: var(--carbon); 
+            border: 1px solid var(--border); 
+            color: #fff; 
+            padding: 12px; 
+            border-radius: 4px; 
+            flex-grow: 1;
+            font-family: inherit;
+        }
+
+        input:focus { border-color: var(--cobalt); outline: none; }
+
+        button { 
+            background: var(--cobalt); 
+            color: #000; 
+            border: none; 
+            padding: 10px 25px; 
+            border-radius: 4px; 
+            cursor: pointer; 
+            font-weight: 800;
+            text-transform: uppercase;
+            transition: all 0.2s;
+        }
+
+        button:hover { filter: brightness(1.1); transform: translateY(-1px); }
+
+        .room-item { 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center;
+            padding: 15px; 
+            border-bottom: 1px solid var(--border); 
+        }
+
+        .room-item:last-child { border-bottom: none; }
+
+        .room-info { display: flex; flex-direction: column; }
+        .room-name { font-weight: bold; color: var(--text); }
+        .room-id { color: var(--cobalt); font-family: monospace; font-size: 0.8em; opacity: 0.7; }
+
+        .status-bar {
+            font-size: 0.75rem;
+            color: var(--success);
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .dot { width: 8px; height: 8px; background: var(--success); border-radius: 50%; box-shadow: 0 0 8px var(--success); }
     </style>
 </head>
 <body>
 <div class="container">
+    <div class="status-bar">
+        <div class="dot"></div>
+        <span>CORE_LINK: ESTABLISHED // OPERATOR_<span id="display-uid">OFFLINE</span></span>
+    </div>
+
     <h1>CONCLAVE_CONTROL_PLANE</h1>
     
     <div class="card">
         <h3>Initialize Network Segment</h3>
-        <input type="text" id="roomName" placeholder="Segment Name">
-        <input type="password" id="roomPw" placeholder="Access Key">
-        <button onclick="createRoom()">CREATE</button>
+        <div class="input-group">
+            <input type="text" id="roomName" placeholder="SEGMENT_NAME">
+            <input type="password" id="roomPw" placeholder="ACCESS_KEY">
+            <button onclick="createRoom()">INITIALIZE</button>
+        </div>
     </div>
 
     <div class="card">
         <h3>Active Segments</h3>
-        <div id="roomList">Scanning...</div>
+        <div id="roomList">SCANNING_NETWORK...</div>
     </div>
 </div>
 
 <script>
     const API_BASE = window.location.origin;
+
+    // 1. PERSISTENT TAB ID
     if (!sessionStorage.getItem('conclave_tab_id')) {
         sessionStorage.setItem('conclave_tab_id', crypto.randomUUID());
     }
     const tabId = sessionStorage.getItem('conclave_tab_id');
 
-    async function refreshRooms() {
-        const res = await fetch(`${API_BASE}/rooms`);
-        const data = await res.json();
-        const list = document.getElementById('roomList');
-        list.innerHTML = "";
-        
-        Object.entries(data.rooms).forEach(([id, name]) => {
-            list.innerHTML += `
-                <div class="room-item">
-                    <span><strong>${name}</strong> <span class="room-id">0x${parseInt(id).toString(16)}</span></span>
-                    <button onclick="joinSequence('${id}')">JOIN</button>
-                </div>`;
-        });
+    // 2. GLOBAL UID EXTRACTION
+    function getStoredUID() {
+        const token = sessionStorage.getItem('conclave_token');
+        if (!token) return null;
+        try {
+            const binaryData = atob(token);
+            return ((binaryData.charCodeAt(0) << 24) |
+                    (binaryData.charCodeAt(1) << 16) |
+                    (binaryData.charCodeAt(2) << 8)  |
+                     binaryData.charCodeAt(3)) >>> 0;
+        } catch (e) {
+            return null;
+        }
     }
 
+    // 3. REFRESH ROOMS LOOP
+    async function refreshRooms() {
+        try {
+            const res = await fetch(`${API_BASE}/rooms`);
+            const data = await res.json();
+            const list = document.getElementById('roomList');
+            
+            if (Object.keys(data.rooms).length === 0) {
+                list.innerHTML = "<div style='color:#64748b; padding:10px;'>NO ACTIVE SEGMENTS DETECTED.</div>";
+                return;
+            }
+
+            list.innerHTML = "";
+            Object.entries(data.rooms).forEach(([id, name]) => {
+                list.innerHTML += `
+                    <div class="room-item">
+                        <div class="room-info">
+                            <span class="room-name">${name}</span>
+                            <span class="room-id">ID: 0x${parseInt(id).toString(16).toUpperCase()}</span>
+                        </div>
+                        <button onclick="joinSequence('${id}')">JOIN</button>
+                    </div>`;
+            });
+        } catch (e) {
+            console.error("Failed to sync room list.");
+        }
+    }
+
+    // 4. ROOM CREATION
     async function createRoom() {
         const name = document.getElementById('roomName').value;
         const pw = document.getElementById('roomPw').value;
+        if (!name || !pw) return alert("Credentials required for initialization.");
+
         await fetch(`${API_BASE}/create-room?room_name=${name}&room_pw=${pw}`, { method: 'POST' });
         setTimeout(refreshRooms, 500);
+        document.getElementById('roomName').value = '';
+        document.getElementById('roomPw').value = '';
     }
 
+    // 5. JOIN SEQUENCE (HANDSHAKE)
     async function joinSequence(roomId) {
-        const token = sessionStorage.getItem('conclave_token');
-        if (token == null) {
-            console.error("Error: No token generated... Refreshing page...");
-            window.location.reload();
-        }
+        const uid = getStoredUID();
+        if (!uid) return window.location.reload();
         
-        const pw = prompt("Enter Segment Access Key:");
+        const pw = prompt("ENTER SEGMENT ACCESS KEY:");
+        if (pw === null) return;
 
-        // 2. Extract the UID from the token.
-        // The first 4 bytes of the decoded base64 are the Big-Endian UID.
-        // >>> 0 forces unsigned 32-bit so high-bit UIDs don't go negative.
-        const binaryData = atob(token);
-        const uid = ((binaryData.charCodeAt(0) << 24) |
-                     (binaryData.charCodeAt(1) << 16) |
-                     (binaryData.charCodeAt(2) << 8)  |
-                      binaryData.charCodeAt(3)) >>> 0;
+        // Cache the password for the E2EE engine in the next page
+        sessionStorage.setItem('last_segment_pw', pw);
 
-        // 3. Register intent to join via the bridge
         const joinRes = await fetch(`${API_BASE}/join?roomId=${roomId}&user_id=${uid}&password=${pw}`, { 
             method: 'PUT' 
         });
         
         if (joinRes.ok) {
-        // Create a hidden form to navigate via POST
-        const form = document.createElement('form');
-        form.method = 'POST';
-        form.action = `/room=${roomId}`; // Clean URL
-
-        const hiddenField = document.createElement('input');
-        hiddenField.type = 'hidden';
-        hiddenField.name = 'uid'; // This matches the 'Form' field in Python
-        hiddenField.value = uid;
-
-        form.appendChild(hiddenField);
-        document.body.appendChild(form);
-        form.submit(); // Browser navigates now
-    } else {
-        const err = await joinRes.json();
-        alert(err.detail || "Join failed");
-    }
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = `/room=${roomId}`;
+            const hiddenField = document.createElement('input');
+            hiddenField.type = 'hidden';
+            hiddenField.name = 'uid';
+            hiddenField.value = uid;
+            form.appendChild(hiddenField);
+            document.body.appendChild(form);
+            form.submit(); 
+        } else {
+            alert("ACCESS_DENIED");
+        }
     }
 
-    // Utility for the "Force Wait"
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+    // 6. SESSION REGISTRATION
     async function registerUser() {
-        
-        if (sessionStorage.getItem('conclave_token')) {
-            console.log("[SYSTEM] Resuming existing session...");
-            return;
-        }
-        
         try {
-            // Poll for status until the Bridge is actually ready
             let ready = false;
             while (!ready) {
                 try {
                     const check = await fetch(`${API_BASE}/status`);
                     if (check.ok) ready = true;
                 } catch (e) {
-                    console.log("Waiting for Bridge...");
-                    await sleep(500); // Wait 500ms before retrying
+                    await sleep(500);
                 }
             }
 
             const tokenRes = await fetch(`${API_BASE}/get-token?tab_id=${tabId}`);
-            const tokenB64 = await tokenRes.json();
-            
-            // Ensure the token is a string, not the whole JSON object
-            const token = (typeof tokenB64 === 'object') ? tokenB64.token : tokenB64;
+            const tokenData = await tokenRes.json();
+            const token = (typeof tokenData === 'object') ? tokenData.token : tokenData;
             
             sessionStorage.setItem('conclave_token', token);
-            console.log("Access Token Synchronized.");
+            document.getElementById('display-uid').innerText = getStoredUID();
             return token;
         } catch(err) {
-            console.error("Token Error:", err);
+            console.error("Handshake failed:", err);
         }
     }
 
-    if (sessionStorage.getItem('conclave_token') == null) {
-        registerUser();
-    } else {
-        fetch(`${API_BASE}/leave?user_id=${uid}`);
-    }
-    refreshRooms();
-    setInterval(refreshRooms, 5000);
+    // 7. BOOTSTRAP / INITIALIZATION
+    async function init() {
+        const currentUID = getStoredUID();
 
+        if (!currentUID) {
+            await registerUser();
+        } else {
+            document.getElementById('display-uid').innerText = currentUID;
+            // CLEANUP: If we land here, we aren't in a room. Tell C++ to clear the map.
+            fetch(`${API_BASE}/leave?user_id=${currentUID}`).catch(() => {});
+        }
+
+        refreshRooms();
+        setInterval(refreshRooms, 5000);
+    }
+
+    init();
 </script>
 </body>
 </html>
