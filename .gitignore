@@ -2,3 +2,4 @@ notes.txt
 *.vscode
 *.cclave
 src/__pycache__
+server
